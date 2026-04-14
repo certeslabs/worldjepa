@@ -102,7 +102,9 @@ class WorldJEPAEncoder(nn.Module):
                 return self.proj(feat)        # (B, out_dim)
 
         self.backbone = MockViT(self.vit_dim).to(device)
-        self.freeze = False
+        if self.freeze:
+            for param in self.backbone.parameters():
+                param.requires_grad_(False)
         return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
