@@ -1,0 +1,18 @@
+# WorldJEPA v0.1 — Apple M4 Pro Config
+encoder_model: vjepa2_vit_large
+freeze_encoder: true
+latent_dim: 1024
+predictor_hidden: 384
+predictor_layers: 12
+predictor_heads: 6
+lambda_sigreg: 0.1
+num_projections: 1024
+num_frames: 16
+resolution: 224
+epochs: 50
+batch_size: 8
+lr: 1.0e-4
+weight_decay: 1.0e-5
+log_every: 10
+save_dir: checkpoints/mac
+save_every: 10
