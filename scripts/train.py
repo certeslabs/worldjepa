@@ -1,297 +1,281 @@
 """
 WorldJEPA v0.1 — Training Script
-Optimized for Apple M4 Pro (MPS backend) and single GPU
+Optimized for Apple M4 Pro (MPS) + CUDA
 
 Usage:
-    # Test pipeline with mock data (no downloads needed):
-    python scripts/train.py --mock --epochs 2 --batch_size 4
+    # Test avec mock data
+    python scripts/train.py --mock --epochs 2 --batch_size 4 --log_every 1
 
-    # Full training on SSv2:
-    python scripts/train.py --data_dir /path/to/ssv2 --epochs 50
+    # Entraînement réel SSv2 — M4 Pro (run court pour tester)
+    python scripts/train.py \
+        --data_dir ~/Data/ssv2 \
+        --max_train_samples 5000 \
+        --freeze_encoder \
+        --batch_size 8 \
+        --epochs 5 \
+        --log_every 5
 
-    # Cloud (A100):
-    python scripts/train.py --data_dir /path/to/ssv2 --epochs 100 --batch_size 32
+    # Entraînement complet SSv2
+    python scripts/train.py \
+        --data_dir ~/Data/ssv2 \
+        --freeze_encoder \
+        --batch_size 8 \
+        --epochs 50
 """
 
 import argparse
 import time
 import sys
 import os
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
 
 from worldjepa.model import WorldJEPA
+from benchmarks.metrics import run_all_benchmarks, print_benchmark_report
 
 
-# ─── Device selection ─────────────────────────────────────────────────────
-
-def get_device() -> torch.device:
-    """Auto-select best available device."""
+def get_device():
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        d = torch.device("cuda")
         print(f"[Device] CUDA — {torch.cuda.get_device_name(0)}")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("[Device] Apple MPS (Metal) — M4 Pro")
+        d = torch.device("mps")
+        print("[Device] Apple MPS — M4 Pro")
     else:
-        device = torch.device("cpu")
-        print("[Device] CPU only")
-    return device
+        d = torch.device("cpu")
+        print("[Device] CPU")
+    return d
 
-
-# ─── Mock dataloader ──────────────────────────────────────────────────────
 
 class MockVideoDataset(torch.utils.data.Dataset):
-    """
-    Synthetic video dataset for testing the pipeline.
-    No downloads required. Generates random tensors.
-    """
-
-    def __init__(self, num_samples=256, T=16, H=224, W=224):
-        self.num_samples = num_samples
+    def __init__(self, n=256, T=16, H=224, W=224):
+        self.n = n
         self.T = T
         self.H = H
         self.W = W
 
     def __len__(self):
-        return self.num_samples
+        return self.n
 
-    def __getitem__(self, idx):
-        # Random video clip (T, C, H, W) normalized to [0, 1]
-        video = torch.rand(self.T, 3, self.H, self.W)
-        return {"video": video}
+    def __getitem__(self, i):
+        return {"video": torch.rand(self.T, 3, self.H, self.W)}
 
-
-# ─── Logging ──────────────────────────────────────────────────────────────
 
 class Logger:
-    def __init__(self, log_every: int = 10):
+    def __init__(self, log_every=10):
         self.log_every = log_every
         self.step = 0
-        self.start_time = time.time()
-        self.history = {
-            "loss": [], "loss_pred": [],
-            "loss_sigreg": [], "isotropy": []
-        }
+        self.t0 = time.time()
+        self.history = {"loss": [], "loss_pred": [], "loss_sigreg": [], "isotropy": []}
 
-    def log(self, metrics: dict):
+    def log(self, m):
         self.step += 1
-        for k, v in metrics.items():
-            if k in self.history:
-                val = v.item() if torch.is_tensor(v) else v
-                self.history[k].append(val)
-
+        for k in self.history:
+            if k in m:
+                v = m[k]
+                self.history[k].append(v.item() if torch.is_tensor(v) else v)
         if self.step % self.log_every == 0:
-            elapsed = time.time() - self.start_time
+            iso = m.get("isotropy", 0)
+            iso = iso.item() if torch.is_tensor(iso) else iso
+            flag = "OK" if iso > 0.1 else "low"
             print(
-                f"  step {self.step:5d} | "
-                f"loss {metrics['loss']:.4f} | "
-                f"pred {metrics['loss_pred']:.4f} | "
-                f"sig {metrics['loss_sigreg']:.4f} | "
-                f"iso {metrics['isotropy']:.4f} | "
-                f"{elapsed:.0f}s"
+                f"  step {self.step:5d} | loss {m['loss']:.4f} | "
+                f"pred {m['loss_pred']:.4f} | sig {m['loss_sigreg']:.4f} | "
+                f"iso {iso:.4f} [{flag}] | {time.time()-self.t0:.0f}s"
             )
 
-    def summary(self, epoch: int):
-        """Print epoch summary."""
-        if not self.history["loss"]:
+    def epoch_summary(self, epoch, val=None):
+        n = min(50, len(self.history["loss"]))
+        if n == 0:
             return
-        recent = -min(100, len(self.history["loss"]))
+        avg_loss = sum(self.history["loss"][-n:]) / n
+        avg_iso = sum(self.history["isotropy"][-n:]) / n
         print(
-            f"\n  ── Epoch {epoch} Summary ──────────────────────\n"
-            f"  loss      : {sum(self.history['loss'][recent:]) / abs(recent):.4f}\n"
-            f"  isotropy  : {sum(self.history['isotropy'][recent:]) / abs(recent):.4f}"
-            f"  (target > 0.1)\n"
+            f"Epoch {epoch} — loss: {avg_loss:.4f} | isotropy: {avg_iso:.4f} "
+            f"[{"healthy" if avg_iso > 0.1 else "low"  }]"
         )
+        if val:
+            print_benchmark_report(val, "Val")
+            if "iso_pred" in val:
+                print(f"  iso_pred  (Z_pred) : {val['iso_pred']:.4f}  <- SIGReg target")
+                print(f"  rank_pred (Z_pred) : {val['rank_pred']:.1f}")
 
 
-# ─── Trainer ──────────────────────────────────────────────────────────────
+@torch.no_grad()
+def validate(model, loader, device, max_batches=20):
+    model.eval()
+    Zs, Zps = [], []
+    for i, batch in enumerate(loader):
+        if i >= max_batches or batch is None:
+            break
+        out = model(batch["video"].to(device))
+        Zs.append(out["Z"].cpu())
+        Zps.append(out["Z_pred"].cpu())
+    model.train()
+    if not Zs:
+        return None
+    Z  = torch.cat(Zs)
+    Zp = torch.cat(Zps)
+    metrics = run_all_benchmarks(Z, Zp)
+    from benchmarks.metrics import isotropy_score, effective_rank
+    Zp_flat = Zp.reshape(-1, Zp.shape[-1])
+    Zp_flat = Zp_flat - Zp_flat.mean(dim=0, keepdim=True)
+    Zp_flat = Zp_flat / (Zp_flat.std(dim=0, keepdim=True) + 1e-6)
+    metrics["iso_pred"]  = isotropy_score(Zp_flat)
+    metrics["rank_pred"] = effective_rank(Zp_flat)
+    return metrics
+
 
 def train(args):
-    print("\n╔══════════════════════════════════════════╗")
-    print("║  WorldJEPA v0.1 — CertesLabs             ║")
-    print("╚══════════════════════════════════════════╝\n")
-
+    print("WorldJEPA v0.1 — CertesLabs")
     device = get_device()
 
-    # ── Model ──────────────────────────────────────────────────────────────
-    print("[Model] Initializing WorldJEPA...")
     model = WorldJEPA(
         latent_dim=args.latent_dim,
         predictor_hidden=args.predictor_hidden,
         predictor_layers=args.predictor_layers,
         predictor_heads=args.predictor_heads,
-        predictor_dropout=0.1,          # Fixed: optimal from LeWM paper
+        predictor_dropout=0.1,
         lambda_sigreg=args.lambda_sigreg,
         num_projections=args.num_projections,
         freeze_encoder=args.freeze_encoder,
         max_seq_len=args.num_frames,
     )
 
-    # Load encoder
     if args.mock:
-        model.encoder.load_mock_encoder(device=device)
+        model.encoder.load_mock_encoder(device=str(device))
     else:
         model.encoder.load_vjepa2_encoder(args.encoder_model)
 
+    # Unfreeze partiel si demandé
+    if hasattr(args, "unfreeze_last_n_layers") and args.unfreeze_last_n_layers > 0:
+        model.encoder.unfreeze_last_n_layers(args.unfreeze_last_n_layers)
+
     model = model.to(device)
+    print(f"[Model] Trainable: {model.num_parameters():,}")
 
-    # Parameter counts
-    total = model.num_parameters(trainable_only=False)
-    trainable = model.num_parameters(trainable_only=True)
-    print(f"[Model] Total params: {total:,} | Trainable: {trainable:,}")
-
-    # ── Data ───────────────────────────────────────────────────────────────
     if args.mock:
-        print(f"[Data] Mock dataset ({args.mock_samples} samples)")
-        dataset = MockVideoDataset(
-            num_samples=args.mock_samples,
-            T=args.num_frames,
-            H=args.resolution,
-            W=args.resolution,
+        tr = torch.utils.data.DataLoader(
+            MockVideoDataset(
+                args.mock_samples, args.num_frames, args.resolution, args.resolution
+            ),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            drop_last=True,
+        )
+        vl = torch.utils.data.DataLoader(
+            MockVideoDataset(64, args.num_frames, args.resolution, args.resolution),
+            batch_size=args.batch_size,
+            num_workers=0,
         )
     else:
-        raise NotImplementedError(
-            "Real SSv2 dataloader coming in next step. "
-            "Use --mock for now."
+        from data.ssv2_dataset import build_ssv2_loaders
+
+        tr, vl = build_ssv2_loaders(
+            data_root=args.data_dir,
+            num_frames=args.num_frames,
+            resolution=args.resolution,
+            batch_size=args.batch_size,
+            num_workers=0,
+            max_train_samples=args.max_train_samples,
+            max_val_samples=500,
         )
 
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,          # 0 for MPS compatibility
-        pin_memory=False,       # False for MPS
-        drop_last=True,
-    )
+    print(f"[Data] {len(tr)} train batches | {len(vl)} val batches")
 
-    # ── Optimizer ──────────────────────────────────────────────────────────
-    # Only optimize trainable parameters (predictor + projector)
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = optim.AdamW(
-        trainable_params,
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.95),
     )
 
-    # Warmup + cosine decay
-    total_steps = args.epochs * len(loader)
-    warmup_steps = min(1000, total_steps // 10)
+    total_steps = args.epochs * len(tr)
+    warmup = min(500, total_steps // 10)
+    scheduler = optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda s: (
+            s / max(1, warmup)
+            if s < warmup
+            else 0.5
+            * (1 + math.cos(math.pi * (s - warmup) / max(1, total_steps - warmup)))
+        ),
+    )
 
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1 + torch.cos(torch.tensor(3.14159 * progress)).item())
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # AMP — CUDA only (MPS doesn't support float16 AMP well yet)
-    use_amp = device.type == "cuda"
-    scaler = GradScaler() if use_amp else None
-
-    # ── Training loop ──────────────────────────────────────────────────────
-    logger = Logger(log_every=args.log_every)
+    logger = Logger(args.log_every)
     model.train()
-
-    print(f"\n[Train] Starting — {args.epochs} epochs, "
-          f"batch={args.batch_size}, lr={args.lr}\n")
+    print(
+        f"[Train] {args.epochs} epochs | batch={args.batch_size} | λ={args.lambda_sigreg}"
+    )
 
     for epoch in range(1, args.epochs + 1):
         print(f"Epoch {epoch}/{args.epochs}")
-
-        for batch in loader:
-            video = batch["video"].to(device)  # (B, T, C, H, W)
-
+        for batch in tr:
+            if batch is None:
+                continue
+            video = batch["video"].to(device)
             optimizer.zero_grad()
-
-            if use_amp:
-                with autocast():
-                    out = model(video)
-                loss = out["loss"]
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                out = model(video)
-                loss = out["loss"]
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-
+            out = model(video)
+            out["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             scheduler.step()
             logger.log(out)
 
-        logger.summary(epoch)
+        val = validate(model, vl, device)
+        logger.epoch_summary(epoch, val)
 
-        # Save checkpoint
         if args.save_dir and epoch % args.save_every == 0:
             os.makedirs(args.save_dir, exist_ok=True)
-            ckpt_path = os.path.join(args.save_dir, f"worldjepa_epoch{epoch}.pt")
-            torch.save({
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "args": vars(args),
-                "history": logger.history,
-            }, ckpt_path)
-            print(f"[Checkpoint] Saved → {ckpt_path}")
+            path = os.path.join(args.save_dir, f"worldjepa_epoch{epoch:03d}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "history": logger.history,
+                    "val": val,
+                },
+                path,
+            )
+            print(f"[Checkpoint] {path}")
 
-    print("\n[Done] Training complete.")
-    print(f"  Final isotropy: {logger.history['isotropy'][-1]:.4f}")
-    print(f"  Final loss:     {logger.history['loss'][-1]:.4f}")
+    print(f"Done. Final isotropy: {logger.history['isotropy'][-1]:.4f}")
 
-
-# ─── CLI ──────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="WorldJEPA v0.1 Training")
-
-    # Data
-    p.add_argument("--mock", action="store_true",
-                   help="Use mock data (no downloads required)")
+    p = argparse.ArgumentParser()
+    p.add_argument("--mock", action="store_true")
     p.add_argument("--mock_samples", type=int, default=256)
-    p.add_argument("--data_dir", type=str, default=None)
+    p.add_argument("--data_dir", default="~/Data/ssv2")
+    p.add_argument("--max_train_samples", type=int, default=None)
     p.add_argument("--num_frames", type=int, default=16)
     p.add_argument("--resolution", type=int, default=224)
-
-    # Model
-    p.add_argument("--encoder_model", type=str, default="vjepa2_vit_large",
-                   choices=["vjepa2_vit_large", "vjepa2_vit_huge", "vjepa2_vit_giant"])
-    p.add_argument("--freeze_encoder", action="store_true", default=True,
-                   help="Freeze encoder (recommended for M4 Pro)")
+    p.add_argument("--encoder_model", default="vjepa2_vit_large")
+    p.add_argument("--freeze_encoder", action="store_true", default=True)
+    p.add_argument("--unfreeze_last_n_layers", type=int, default=0,
+                   help="Dégèle les n dernières couches encoder (0=frozen)")
+    p.add_argument("--lr_encoder", type=float, default=1e-5,
+                   help="LR pour les couches encoder dégelées (10x plus petit)")
     p.add_argument("--latent_dim", type=int, default=1024)
     p.add_argument("--predictor_hidden", type=int, default=384)
     p.add_argument("--predictor_layers", type=int, default=12)
     p.add_argument("--predictor_heads", type=int, default=6)
-
-    # SIGReg
-    p.add_argument("--lambda_sigreg", type=float, default=0.1,
-                   help="SIGReg weight λ (stable in [0.01, 0.2])")
+    p.add_argument("--lambda_sigreg", type=float, default=0.1)
     p.add_argument("--num_projections", type=int, default=1024)
-
-    # Training
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch_size", type=int, default=8,
-                   help="Recommended: 8 for M4 Pro, 32 for A100")
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
-
-    # Logging & saving
     p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--save_dir", type=str, default="checkpoints")
-    p.add_argument("--save_every", type=int, default=10)
-
+    p.add_argument("--save_dir", default="checkpoints")
+    p.add_argument("--save_every", type=int, default=5)
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+    train(parse_args())

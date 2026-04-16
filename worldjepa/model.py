@@ -57,24 +57,86 @@ class WorldJEPAEncoder(nn.Module):
 
     def load_vjepa2_encoder(self, model_name: str = "vjepa2_vit_large"):
         """
-        Load pretrained V-JEPA 2 ViT-L encoder via torch.hub.
+        Load pretrained V-JEPA 2 ViT-L from HuggingFace via transformers.
+        Repo: facebook/vjepa2-vitl-fpc64-256
 
-        Args:
-            model_name: one of 'vjepa2_vit_large', 'vjepa2_vit_huge', 'vjepa2_vit_giant'
+        Uses transformers.AutoModel which handles the exact V-JEPA 2
+        architecture and weight mapping correctly.
         """
-        print(f"[WorldJEPA] Loading {model_name} from facebookresearch/vjepa2...")
-        self.backbone = torch.hub.load(
-            "facebookresearch/vjepa2",
-            model_name,
-            trust_repo=True,
+        from transformers import AutoModel
+        import torch.nn as nn
+
+        print(f"[WorldJEPA] Loading V-JEPA 2 via transformers.AutoModel...")
+
+        vjepa2 = AutoModel.from_pretrained(
+            "facebook/vjepa2-vitl-fpc64-256",
+            trust_remote_code=True,
         )
 
+        # V-JEPA 2 via transformers wraps a vision model
+        # We extract the encoder and wrap it for frame-by-frame encoding
+        class VJEPA2FrameEncoder(nn.Module):
+            """
+            Wraps V-JEPA 2 to encode individual frames.
+            Takes (B, C, H, W) → (B, hidden_dim)
+            by treating each frame as a 1-frame video clip.
+            """
+            def __init__(self, vjepa2_model, hidden_dim=1024):
+                super().__init__()
+                self.vjepa2 = vjepa2_model
+                self.hidden_dim = hidden_dim
+
+            def forward(self, x):
+                # x: (B, C, H, W) — single frame
+                B = x.shape[0]
+                # Add temporal dim: (B, 1, C, H, W)
+                video = x.unsqueeze(1)
+                # V-JEPA 2 expects pixel_values_videos: (B, T, C, H, W)
+                with torch.no_grad() if self.training == False else torch.enable_grad():
+                    out = self.vjepa2(pixel_values_videos=video)
+                # last_hidden_state: (B, seq_len, hidden_dim)
+                # Take CLS token (index 0) as frame representation
+                feat = out.last_hidden_state[:, 0, :]  # (B, hidden_dim)
+                return feat
+
+        self.backbone = VJEPA2FrameEncoder(vjepa2)
+        self.vit_dim = 1024
+
+        total_params = sum(p.numel() for p in vjepa2.parameters())
+        print(f"[WorldJEPA] V-JEPA 2 loaded — {total_params:,} params")
+
         if self.freeze:
-            print("[WorldJEPA] Encoder frozen — only predictor will train.")
+            print("[WorldJEPA] Encoder frozen — only predictor trains.")
             for param in self.backbone.parameters():
                 param.requires_grad_(False)
-        else:
-            print("[WorldJEPA] Encoder unfrozen — full end-to-end training.")
+
+    def unfreeze_last_n_layers(self, n: int = 2):
+        """Dégèle les n dernières couches du transformer.
+        Utilisé pour Run C — unfreeze partiel avec lr différencié.
+        """
+        if self.backbone is None:
+            raise RuntimeError("Load encoder before unfreezing.")
+
+        # Récupère tous les modules de type transformer layer
+        layers = []
+        for module in self.backbone.modules():
+            if hasattr(module, "layer") and isinstance(module.layer, torch.nn.ModuleList):
+                layers = list(module.layer)
+                break
+
+        if not layers:
+            # Fallback : dégèle les n derniers paramètres nommés
+            params = list(self.backbone.named_parameters())
+            for name, param in params[-n*10:]:
+                param.requires_grad_(True)
+                print(f"[WorldJEPA] Unfrozen: {name}")
+            return
+
+        # Dégèle les n dernières couches
+        for layer in layers[-n:]:
+            for param in layer.parameters():
+                param.requires_grad_(True)
+        print(f"[WorldJEPA] Unfrozen last {n} layers ({sum(p.numel() for l in layers[-n:] for p in l.parameters()):,} params)")
 
         return self
 
@@ -89,22 +151,23 @@ class WorldJEPAEncoder(nn.Module):
             def __init__(self, out_dim):
                 super().__init__()
                 self.out_dim = out_dim
-                # Minimal conv + pooling to simulate ViT output
                 self.conv = nn.Conv2d(3, 64, kernel_size=16, stride=16)
                 self.pool = nn.AdaptiveAvgPool2d(1)
                 self.proj = nn.Linear(64, out_dim)
 
             def forward(self, x):
-                # x: (B, C, H, W)
-                feat = self.conv(x)           # (B, 64, H', W')
-                feat = self.pool(feat)        # (B, 64, 1, 1)
-                feat = feat.flatten(1)        # (B, 64)
-                return self.proj(feat)        # (B, out_dim)
+                feat = self.conv(x)
+                feat = self.pool(feat)
+                feat = feat.flatten(1)
+                return self.proj(feat)
 
         self.backbone = MockViT(self.vit_dim).to(device)
+
+        # Respect the freeze setting
         if self.freeze:
             for param in self.backbone.parameters():
                 param.requires_grad_(False)
+
         return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -344,7 +407,10 @@ class WorldJEPA(nn.Module):
         # Reshape: (B, T, D) → T × (B, D) for per-timestep computation
         sigreg_losses = []
         for t in range(T):
-            Z_t = Z[:, t, :]                   # (B, D)
+            # SIGReg sur Z_pred — le predictor est entraînable
+            # même avec encoder gelé, le predictor peut apprendre
+            # à produire des embeddings isotropiques
+            Z_t = Z_pred[:, t, :]              # (B, D)
             sigreg_losses.append(self.sigreg(Z_t))
         loss_sigreg = torch.stack(sigreg_losses).mean()
 

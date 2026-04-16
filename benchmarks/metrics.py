@@ -37,7 +37,14 @@ def isotropy_score(Z: torch.Tensor) -> float:
 
     try:
         eigvals = torch.linalg.eigvalsh(cov).clamp(min=0)
-        score = (eigvals.min() / (eigvals.max() + 1e-10)).item()
+        # Filtre les valeurs propres nulles (espace sous-dimensionné)
+        # quand N < D, seules N valeurs propres sont non-nulles
+        threshold = eigvals.max() * 1e-4
+        nonzero = eigvals[eigvals > threshold]
+        if len(nonzero) < 2:
+            score = 0.0
+        else:
+            score = (nonzero.min() / (nonzero.max() + 1e-10)).item()
     except Exception:
         score = 0.0
 

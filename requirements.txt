@@ -21,5 +21,10 @@ wandb>=0.16.0
 # Evaluation
 scikit-learn>=1.3.0
 
+# V-JEPA 2 deps
+timm>=0.9.0
+einops>=0.7.0
+safetensors>=0.4.0
+
 # Dev
 pytest>=7.0.0
