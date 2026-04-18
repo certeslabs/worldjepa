@@ -25,7 +25,6 @@ checkpoints/
 !tests/fixtures/*.pt
 
 # Data
-data/
 *.h5
 *.hdf5
 *.mp4
