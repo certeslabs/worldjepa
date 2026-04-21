@@ -5,6 +5,7 @@ from __future__ import annotations
 import statistics
 
 import torch
+import lejepa
 
 from micro_exp_common import (
     build_arg_parser,
@@ -24,8 +25,6 @@ def main() -> None:
 
     device = pick_device(args.device)
     print(f"[micro-exp-3] device={device}")
-
-    import lejepa
 
     sigreg = lejepa.multivariate.SlicingUnivariateTest(
         univariate_test=lejepa.univariate.EppsPulley(n_points=17),

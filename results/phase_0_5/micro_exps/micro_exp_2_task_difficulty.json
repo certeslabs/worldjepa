@@ -1,0 +1,17 @@
+{
+  "output_shape": [
+    500,
+    2304,
+    768
+  ],
+  "z_per_frame_shape": [
+    500,
+    4,
+    768
+  ],
+  "t_eff": 4,
+  "n_spatial": 576,
+  "cos_adjacent": 0.9736706018447876,
+  "cos_random": 0.9171804189682007,
+  "task_difficulty_ratio": 0.3179127185526693
+}

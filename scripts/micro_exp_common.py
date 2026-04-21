@@ -74,7 +74,17 @@ def collect_encoder_outputs(
         if batch is None:
             continue
         videos = batch["video"].to(device)
+
+        # FIX V-JEPA 2.1 format
+        videos = videos.permute(0, 2, 1, 3, 4).contiguous()
+
+        # Sanity check (temporaire mais recommandé)
+        assert videos.shape[1] == 3, f"Expected 3 channels, got {videos.shape}"
+
         out = encoder(videos)
+        if batch_idx == 0:
+            print("Input shape (after permute):", videos.shape)
+            print("Encoder output shape:", out.shape)
         if not isinstance(out, torch.Tensor):
             raise TypeError(f"Expected tensor output, got {type(out)}")
         outs.append(out.cpu())
@@ -106,3 +116,9 @@ def save_json(output_dir: str, filename: str, payload: Dict) -> Path:
     out_path = out_dir / filename
     out_path.write_text(json.dumps(payload, indent=2))
     return out_path
+
+
+def reshape_tokens(out, num_frames, resolution):
+    B, N, D = out.shape
+    t_eff, n_spatial = infer_layout(N, num_frames, resolution)
+    return out.view(B, t_eff, n_spatial, D)
