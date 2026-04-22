@@ -1,466 +1,469 @@
 """
-WorldJEPA v0.1 — Core Model
-CertesLabs · April 2026
+worldjepa/model.py — Phase 0.5
 
 Architecture:
-  - Encoder: ViT-L (~300M) initialized from V-JEPA 2 pretrained weights
-  - Predictor: ViT-S (~22M) trained from scratch with causal attention
-  - Training objective: MSE prediction + SIGReg (no EMA, no stop-grad)
+  Encoder : frozen V-JEPA 2.1 ViT-B (80M) or ViT-L (300M) via torch.hub.
+             The hub call returns (encoder, predictor); we discard the predictor
+             deliberately.  V-JEPA 2.1's predictor is trained on spatial-masking
+             with mask-distance-weighted Lctx — a different factorisation from
+             WorldJEPA's temporal-causal objective.  Mixing them would be
+             meaningless.  What we test is SIGReg applied to a temporal prediction
+             head atop frozen V-JEPA 2.1 patch features, not "V-JEPA 2.1 + SIGReg"
+             as a joint system.  See PRE_REGISTRATION.md §framing.
 
-Based on principles from:
-  - V-JEPA 2 (Assran et al., Meta FAIR, 2025) — MIT License
-  - LeWorldModel (Maes et al., 2026) — MIT License
+  Projector: Linear → BatchNorm1d  (LeWM §3.1; BN counteracts ViT's final
+             LayerNorm and prevents SIGReg from fighting the encoder's normalization).
+             No LayerNorm here — see plan v3 D2 Fix 2.
+
+  Predictor: Causal transformer with hidden_dim = latent_dim (= encoder's
+             embed_dim = 768 for ViT-B, 1024 for ViT-L).  Setting hidden_dim
+             smaller caps achievable rank regardless of SIGReg — see plan D2 Fix 1.
+
+  SIGReg:   lejepa.multivariate.SlicingUnivariateTest with
+             EppsPulley(n_points=17).
+             NOTE: the README contains a stale kwarg spelling; the installed
+             package uses n_points=17.  Verified by inspection.
+             See plan v3 D2 Fix 4 and tests/test_lejepa_api.py.
+
+  Loss:     L = MSE(Z_pred, sg(Z_target)) + λ · SIGReg(Z_pred_flat)
+             where sg() is stop-gradient applied to the encoder targets.
+
+Geometry (ViT-B, T input frames, 384×384):
+  tubelet_size = 2  →  T_eff = T // 2  temporal positions
+  patch_size   = 16 →  24×24 = 576 spatial patches per position
+  total tokens      →  T_eff × 576
+  encoder output    →  (B, T_eff × 576, 768)
+  after mean pool   →  (B, T_eff, 768)
+
+Usage:
+    model = WorldJEPA(encoder_variant="vitb", freeze_encoder=True)
+    out   = model(video)  # video: (B, T, C, H, W)
+    loss  = out["loss"]
 """
+
+from __future__ import annotations
+
+import math
+import warnings
+from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
-from worldjepa.sigreg import SIGRegFast
+import lejepa
+
+# ---------------------------------------------------------------------------
+# Constants derived from V-JEPA 2.1 architecture
+# ---------------------------------------------------------------------------
+
+_VARIANT_CONFIG = {
+    "vitb": {
+        "hub_name": "vjepa2_1_vit_base_384",
+        "embed_dim": 768,
+        "default_predictor_layers": 6,
+    },
+    "vitl": {
+        "hub_name": "vjepa2_1_vit_large_384",
+        "embed_dim": 1024,
+        "default_predictor_layers": 12,
+    },
+}
+
+_TUBELET_SIZE = 2  # V-JEPA 2.1 default; patchifies consecutive frame pairs
+_PATCH_SIZE = 16  # spatial patch size in pixels
+_RESOLUTION = 384  # expected input resolution
+_N_SPATIAL = (_RESOLUTION // _PATCH_SIZE) ** 2  # 576 patches per temporal position
 
 
-# ─── Encoder ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Encoder wrapper
+# ---------------------------------------------------------------------------
 
-class WorldJEPAEncoder(nn.Module):
+
+def _load_vjepa21_encoder(variant: str) -> nn.Module:
     """
-    ViT-L encoder initialized from V-JEPA 2 pretrained weights.
+    Load the V-JEPA 2.1 encoder via torch.hub.
 
-    For v0.1, can be:
-    - Frozen: only predictor trains (fast, fits M4 Pro)
-    - Fine-tuned: full end-to-end (requires more compute)
+    The hub call returns a (encoder, predictor) tuple.  We discard the
+    predictor — see module docstring for the rationale.
 
-    Output: CLS token + projection → latent z of dimension `latent_dim`
+    Returns:
+        encoder set to eval() with all parameters frozen.
+    """
+    cfg = _VARIANT_CONFIG[variant]
+    encoder, _predictor_discarded = torch.hub.load(
+        "facebookresearch/vjepa2",
+        cfg["hub_name"],
+        trust_repo=True,
+    )
+    # Freeze all encoder parameters.  This is non-negotiable for Phase 0.5:
+    # we are not end-to-end fine-tuning; we characterise SIGReg in the
+    # frozen-encoder regime.
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+    return encoder
+
+
+class FrozenVJEPA21Encoder(nn.Module):
+    """
+    Thin wrapper around a frozen V-JEPA 2.1 backbone.
+
+    Handles the patch-token reshape and pooling so that the rest of the
+    model sees clean (B, T_eff, D) tensors.
     """
 
     def __init__(
         self,
-        vit_dim: int = 1024,          # ViT-L hidden dimension
-        latent_dim: int = 1024,        # Output latent dimension
-        freeze: bool = True,           # Freeze encoder for v0.1
-        use_cls_token: bool = True,    # Use CLS token as frame representation
+        variant: str = "vitb",
+        feature_mode: Literal["mean", "cls"] = "mean",
     ):
         super().__init__()
-        self.vit_dim = vit_dim
-        self.latent_dim = latent_dim
-        self.freeze = freeze
+        assert (
+            variant in _VARIANT_CONFIG
+        ), f"Unknown variant '{variant}'. Choices: {list(_VARIANT_CONFIG)}"
+        self.variant = variant
+        self.embed_dim = _VARIANT_CONFIG[variant]["embed_dim"]
+        self.feature_mode = feature_mode
+        self.backbone = _load_vjepa21_encoder(variant)
 
-        # Projection head: maps ViT-L output → latent space
-        # 1-layer MLP with BatchNorm, critical for SIGReg (see LeWM paper §3)
-        self.projector = nn.Sequential(
-            nn.Linear(vit_dim, latent_dim),
-            nn.BatchNorm1d(latent_dim),
+    def forward(self, videos: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            videos: (B, T, C, H, W)  — T must be even (tubelet_size=2).
+
+        Returns:
+            Z: (B, T_eff, D)  where T_eff = T // 2.
+        """
+        B, T, C, H, W = videos.shape
+        assert (
+            T % _TUBELET_SIZE == 0
+        ), f"T={T} must be divisible by tubelet_size={_TUBELET_SIZE}"
+        assert (
+            H == W == _RESOLUTION
+        ), f"Expected {_RESOLUTION}×{_RESOLUTION} input, got {H}×{W}"
+
+        T_eff = T // _TUBELET_SIZE
+
+        # Encoder is frozen — no grad needed here.
+        with torch.no_grad():
+            videos_bcthw = videos.permute(
+                0, 2, 1, 3, 4
+            ).contiguous()  # (B,C,T,H,W) pour V-JEPA 2.1
+            out = self.backbone(videos_bcthw)  # (B, T_eff × N_spatial, D)
+
+        B_out, N_tot, D = out.shape
+        assert (
+            D == self.embed_dim
+        ), f"embed_dim mismatch: expected {self.embed_dim}, got {D}"
+        expected_tokens = T_eff * _N_SPATIAL
+        assert N_tot == expected_tokens, (
+            f"Token count mismatch: expected {expected_tokens} "
+            f"(T_eff={T_eff} × N_spatial={_N_SPATIAL}), got {N_tot}. "
+            "Check that input resolution is 384 and T is correct."
         )
 
-        # Backbone will be loaded separately via load_vjepa2_encoder()
-        self.backbone = None
+        out = out.reshape(B, T_eff, _N_SPATIAL, D)
 
-    def load_vjepa2_encoder(self, model_name: str = "vjepa2_vit_large"):
-        """
-        Load pretrained V-JEPA 2 ViT-L from HuggingFace via transformers.
-        Repo: facebook/vjepa2-vitl-fpc64-256
+        if self.feature_mode == "mean":
+            Z = out.mean(dim=2)  # (B, T_eff, D) — mean over spatial patches
+        elif self.feature_mode == "cls":
+            # "cls" here means first patch token — V-JEPA 2.1 has no dedicated
+            # CLS token.  Micro-exp 1 should confirm mean >> cls.
+            Z = out[:, :, 0, :]  # (B, T_eff, D)
+        else:
+            raise ValueError(f"Unknown feature_mode: {self.feature_mode!r}")
 
-        Uses transformers.AutoModel which handles the exact V-JEPA 2
-        architecture and weight mapping correctly.
-        """
-        from transformers import AutoModel
-        import torch.nn as nn
+        return Z  # (B, T_eff, D)
 
-        print(f"[WorldJEPA] Loading V-JEPA 2 via transformers.AutoModel...")
 
-        vjepa2 = AutoModel.from_pretrained(
-            "facebook/vjepa2-vitl-fpc64-256",
-            trust_remote_code=True,
-        )
+# ---------------------------------------------------------------------------
+# Projector
+# ---------------------------------------------------------------------------
 
-        # V-JEPA 2 via transformers wraps a vision model
-        # We extract the encoder and wrap it for frame-by-frame encoding
-        class VJEPA2FrameEncoder(nn.Module):
-            """
-            Wraps V-JEPA 2 to encode individual frames.
-            Takes (B, C, H, W) → (B, hidden_dim)
-            by treating each frame as a 1-frame video clip.
-            """
-            def __init__(self, vjepa2_model, hidden_dim=1024):
-                super().__init__()
-                self.vjepa2 = vjepa2_model
-                self.hidden_dim = hidden_dim
 
-            def forward(self, x):
-                # x: (B, C, H, W) — single frame
-                B = x.shape[0]
-                # Add temporal dim: (B, 1, C, H, W)
-                video = x.unsqueeze(1)
-                # V-JEPA 2 expects pixel_values_videos: (B, T, C, H, W)
-                with torch.no_grad() if self.training == False else torch.enable_grad():
-                    out = self.vjepa2(pixel_values_videos=video)
-                # last_hidden_state: (B, seq_len, hidden_dim)
-                # Take CLS token (index 0) as frame representation
-                feat = out.last_hidden_state[:, 0, :]  # (B, hidden_dim)
-                return feat
+class Projector(nn.Module):
+    """
+    Linear → BatchNorm1d projector.
 
-        self.backbone = VJEPA2FrameEncoder(vjepa2)
-        self.vit_dim = 1024
+    BatchNorm is intentional (LeWM §3.1): it counteracts the ViT's final
+    LayerNorm, which otherwise prevents SIGReg from shaping the distribution.
+    Do NOT replace with LayerNorm.
 
-        total_params = sum(p.numel() for p in vjepa2.parameters())
-        print(f"[WorldJEPA] V-JEPA 2 loaded — {total_params:,} params")
+    The input/output dimensionality can differ (e.g. project 768 → 768),
+    but both are required; no silent defaults.
+    """
 
-        if self.freeze:
-            print("[WorldJEPA] Encoder frozen — only predictor trains.")
-            for param in self.backbone.parameters():
-                param.requires_grad_(False)
-
-    def unfreeze_last_n_layers(self, n: int = 2):
-        """Dégèle les n dernières couches du transformer.
-        Utilisé pour Run C — unfreeze partiel avec lr différencié.
-        """
-        if self.backbone is None:
-            raise RuntimeError("Load encoder before unfreezing.")
-
-        # Récupère tous les modules de type transformer layer
-        layers = []
-        for module in self.backbone.modules():
-            if hasattr(module, "layer") and isinstance(module.layer, torch.nn.ModuleList):
-                layers = list(module.layer)
-                break
-
-        if not layers:
-            # Fallback : dégèle les n derniers paramètres nommés
-            params = list(self.backbone.named_parameters())
-            for name, param in params[-n*10:]:
-                param.requires_grad_(True)
-                print(f"[WorldJEPA] Unfrozen: {name}")
-            return
-
-        # Dégèle les n dernières couches
-        for layer in layers[-n:]:
-            for param in layer.parameters():
-                param.requires_grad_(True)
-        print(f"[WorldJEPA] Unfrozen last {n} layers ({sum(p.numel() for l in layers[-n:] for p in l.parameters()):,} params)")
-
-        return self
-
-    def load_mock_encoder(self, device="cpu"):
-        """
-        Lightweight mock encoder for testing pipeline without downloading weights.
-        Replaces ViT-L with a small random network — same API, different capacity.
-        """
-        print("[WorldJEPA] Using MOCK encoder (for testing only)")
-
-        class MockViT(nn.Module):
-            def __init__(self, out_dim):
-                super().__init__()
-                self.out_dim = out_dim
-                self.conv = nn.Conv2d(3, 64, kernel_size=16, stride=16)
-                self.pool = nn.AdaptiveAvgPool2d(1)
-                self.proj = nn.Linear(64, out_dim)
-
-            def forward(self, x):
-                feat = self.conv(x)
-                feat = self.pool(feat)
-                feat = feat.flatten(1)
-                return self.proj(feat)
-
-        self.backbone = MockViT(self.vit_dim).to(device)
-
-        # Respect the freeze setting
-        if self.freeze:
-            for param in self.backbone.parameters():
-                param.requires_grad_(False)
-
-        return self
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim, bias=False)
+        self.bn = nn.BatchNorm1d(out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Encode a single frame.
-
         Args:
-            x: (B, C, H, W) — single video frame
+            x: (..., in_dim) — any leading batch dimensions.
 
         Returns:
-            z: (B, latent_dim) — latent embedding
+            y: (..., out_dim)
         """
-        assert self.backbone is not None, \
-            "Call load_vjepa2_encoder() or load_mock_encoder() first."
-
-        if self.freeze:
-            with torch.no_grad():
-                feat = self.backbone(x)  # (B, vit_dim)
-        else:
-            feat = self.backbone(x)
-
-        z = self.projector(feat)  # (B, latent_dim)
-        return z
-
-    def encode_video(self, video: torch.Tensor) -> torch.Tensor:
-        """
-        Encode all frames of a video clip independently.
-
-        Args:
-            video: (B, T, C, H, W)
-
-        Returns:
-            Z: (B, T, latent_dim)
-        """
-        B, T, C, H, W = video.shape
-        # Reshape to process all frames in one batch
-        frames = video.reshape(B * T, C, H, W)
-        Z_flat = self.forward(frames)          # (B*T, latent_dim)
-        Z = Z_flat.reshape(B, T, self.latent_dim)
-        return Z
+        shape = x.shape
+        x_flat = x.reshape(-1, shape[-1])  # (N, in_dim)
+        y_flat = self.bn(self.proj(x_flat))  # (N, out_dim)
+        return y_flat.reshape(*shape[:-1], -1)  # (..., out_dim)
 
 
-# ─── Predictor ────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Temporal causal predictor
+# ---------------------------------------------------------------------------
 
-class WorldJEPAPredictor(nn.Module):
+
+class TemporalCausalPredictor(nn.Module):
     """
-    Causal transformer predictor.
+    Autoregressive causal transformer that predicts Z_{t+1} given Z_{0:t}.
 
-    Takes a history of N latent frames and predicts the next frame embedding.
-    Architecture: ViT-S equivalent with causal masking.
+    hidden_dim MUST equal latent_dim (the encoder's embed_dim).  A smaller
+    hidden_dim caps achievable rank regardless of SIGReg — see plan D2 Fix 1
+    and arXiv:2512.24497 §predictor.
 
-    Key differences from LeWM:
-    - No action conditioning (action-free for v0.1)
-    - Operates on higher-dim latents (1024 vs 192 in LeWM)
-    - Trained from scratch (random init)
+    The causal mask is built once in __init__ and registered as a buffer
+    so it moves to the correct device automatically.
     """
 
     def __init__(
         self,
-        latent_dim: int = 1024,    # Input/output dimension (matches encoder)
-        hidden_dim: int = 384,     # Internal predictor dimension (ViT-S)
-        num_layers: int = 12,      # Transformer depth
-        num_heads: int = 6,        # Attention heads
-        dropout: float = 0.1,     # Critical: 0.1 is optimal (LeWM ablation Table 9)
-        max_seq_len: int = 16,     # Max number of frames in history
+        latent_dim: int,
+        num_layers: int | None = None,
+        num_heads: int = 8,
+        ffn_mult: float = 4.0,
+        dropout: float = 0.0,
+        max_seq_len: int = 64,
     ):
         super().__init__()
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.max_seq_len = max_seq_len
 
-        # Project from latent_dim → hidden_dim
-        self.input_proj = nn.Linear(latent_dim, hidden_dim)
+        # hidden_dim == latent_dim is enforced (plan D2 Fix 1)
+        hidden_dim = latent_dim
 
-        # Learned positional embeddings
-        self.pos_embed = nn.Embedding(max_seq_len, hidden_dim)
+        # Default num_layers by encoder size (plan §Fix 1 comment)
+        if num_layers is None:
+            num_layers = 6 if latent_dim == 768 else 12
 
-        # Causal transformer
+        # Sinusoidal position embedding
+        self.register_buffer("pos_emb", _sinusoidal_pos_emb(max_seq_len, latent_dim))
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
+            dim_feedforward=int(hidden_dim * ffn_mult),
             dropout=dropout,
-            activation="gelu",
             batch_first=True,
-            norm_first=True,  # Pre-norm for stability
+            norm_first=True,  # pre-norm (more stable)
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
         )
 
-        # Project back from hidden_dim → latent_dim
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, latent_dim),
-            nn.BatchNorm1d(latent_dim),  # BatchNorm on output too
-        )
+        # Causal mask: upper-triangular with -inf above diagonal
+        causal = torch.full((max_seq_len, max_seq_len), float("-inf"))
+        causal = torch.triu(causal, diagonal=1)
+        self.register_buffer("causal_mask", causal)
 
-        # Causal mask — will be built lazily
-        self._causal_mask = None
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights for training stability."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.trunc_normal_(module.weight, std=0.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        """Build causal attention mask — cached for efficiency."""
-        if self._causal_mask is None or self._causal_mask.shape[0] != seq_len:
-            mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device) * float("-inf"),
-                diagonal=1,
-            )
-            self._causal_mask = mask
-        return self._causal_mask.to(device)
+        self.out_norm = nn.LayerNorm(latent_dim)
 
     def forward(self, Z: torch.Tensor) -> torch.Tensor:
         """
-        Predict next latent states for all timesteps (teacher forcing).
-
         Args:
-            Z: (B, T, latent_dim) — sequence of encoded frame embeddings
+            Z: (B, T, D)  — projected encoder features.
 
         Returns:
-            Z_pred: (B, T, latent_dim) — predicted next-frame embeddings
-                    Z_pred[:, t, :] predicts Z[:, t+1, :]
+            Z_pred: (B, T, D)  — predicted representation for position t+1
+                    (i.e. Z_pred[:, t, :] is the prediction of Z[:, t+1, :]).
         """
         B, T, D = Z.shape
-        device = Z.device
+        assert D == self.latent_dim, f"Input dim {D} ≠ latent_dim {self.latent_dim}"
 
-        # Project to hidden dim
-        h = self.input_proj(Z)  # (B, T, hidden_dim)
-
-        # Add positional embeddings
-        positions = torch.arange(T, device=device)
-        h = h + self.pos_embed(positions).unsqueeze(0)  # (B, T, hidden_dim)
-
-        # Causal self-attention
-        causal_mask = self._get_causal_mask(T, device)
-        h = self.transformer(h, mask=causal_mask)  # (B, T, hidden_dim)
-
-        # Project back: reshape for BatchNorm, then restore
-        h_flat = h.reshape(B * T, self.hidden_dim)
-        Z_pred_flat = self.output_proj(h_flat)        # (B*T, latent_dim)
-        Z_pred = Z_pred_flat.reshape(B, T, D)
-
-        return Z_pred
+        x = Z + self.pos_emb[:T]  # (B, T, D)
+        mask = self.causal_mask[:T, :T]
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return self.out_norm(x)  # (B, T, D)
 
 
-# ─── Full WorldJEPA Model ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Full WorldJEPA model
+# ---------------------------------------------------------------------------
+
 
 class WorldJEPA(nn.Module):
     """
-    WorldJEPA v0.1 — Complete world model.
+    WorldJEPA Phase 0.5.
 
     Training objective:
-        L = L_pred + λ · SIGReg(Z)
+        L = MSE(Z_pred, sg(Z_target)) + λ · SIGReg(Z_pred_flat)
 
-        L_pred  = MSE(Z_pred[:, :-1], Z[:, 1:].detach())
-        SIGReg  = Sketched Isotropic Gaussian Regularizer (step-wise)
+    where:
+        Z        = FrozenEncoder(video)        projected (B, T_eff, D)
+        Z_pred   = Predictor(Z)                (B, T_eff, D)
+        Z_target = Z shifted by 1              (B, T_eff-1, D)
+        sg()     = stop-gradient (encoder targets are not differentiated)
+        SIGReg   = lejepa.multivariate.SlicingUnivariateTest
 
-    No EMA. No stop-gradient tricks. No action conditioning.
+    The SIGReg term regularises Z_pred towards an isotropic Gaussian,
+    preventing collapse without teacher-student or momentum encoders.
+
+    sigreg_reduction:
+        "per_timestep" — SIGReg is computed separately for each temporal
+                         position and averaged (LeWM-style).  Requires B≥32.
+        "flatten"      — Z_pred is reshaped to (B×T, D) before SIGReg.
+                         Viable at small batch sizes (e.g. T4 batch 16).
     """
 
     def __init__(
         self,
-        latent_dim: int = 1024,
-        predictor_hidden: int = 384,
-        predictor_layers: int = 12,
-        predictor_heads: int = 6,
-        predictor_dropout: float = 0.1,
-        lambda_sigreg: float = 0.1,
-        num_projections: int = 1024,
+        encoder_variant: str = "vitb",
         freeze_encoder: bool = True,
-        max_seq_len: int = 16,
+        feature_mode: Literal["mean", "cls"] = "mean",
+        lambda_sigreg: float = 0.1,
+        sigreg_reduction: Literal["per_timestep", "flatten"] = "per_timestep",
+        # predictor kwargs
+        predictor_layers: int | None = None,
+        predictor_heads: int = 8,
+        predictor_ffn_mult: float = 4.0,
+        predictor_dropout: float = 0.0,
     ):
         super().__init__()
 
+        assert freeze_encoder, (
+            "freeze_encoder=False is not supported in Phase 0.5. "
+            "End-to-end fine-tuning is Phase 2+."
+        )
+
+        cfg = _VARIANT_CONFIG[encoder_variant]
+        self.embed_dim = cfg["embed_dim"]
         self.lambda_sigreg = lambda_sigreg
+        self.sigreg_reduction = sigreg_reduction
 
-        # Components
-        self.encoder = WorldJEPAEncoder(
-            vit_dim=1024,
-            latent_dim=latent_dim,
-            freeze=freeze_encoder,
+        # ── Encoder (frozen) ──────────────────────────────────────────────
+        self.encoder = FrozenVJEPA21Encoder(
+            variant=encoder_variant, feature_mode=feature_mode
         )
 
-        self.predictor = WorldJEPAPredictor(
-            latent_dim=latent_dim,
-            hidden_dim=predictor_hidden,
-            num_layers=predictor_layers,
+        # ── Projector (encoder → predictor space) ─────────────────────────
+        # Dimension is preserved (in = out = embed_dim).  The projector's
+        # BatchNorm is the critical component — see LeWM §3.1.
+        self.projector = Projector(in_dim=self.embed_dim, out_dim=self.embed_dim)
+
+        # ── Temporal causal predictor ─────────────────────────────────────
+        self.predictor = TemporalCausalPredictor(
+            latent_dim=self.embed_dim,
+            num_layers=predictor_layers or cfg["default_predictor_layers"],
             num_heads=predictor_heads,
+            ffn_mult=predictor_ffn_mult,
             dropout=predictor_dropout,
-            max_seq_len=max_seq_len,
         )
 
-        self.sigreg = SIGRegFast(
-            num_projections=num_projections,
+        # ── SIGReg (lejepa official library) ──────────────────────────────
+        # IMPORTANT: the constructor kwarg is `n_points`, not the variant
+        # spelled with an underscore-less prefix that appears in the README.
+        # The README is outdated; the installed code uses n_points.
+        # Verified: inspect.signature(lejepa.univariate.EppsPulley.__init__)
+        # → (self, t_max: float = 3, n_points: int = 17, integration: str = 'trapezoid')
+        # See tests/test_lejepa_api.py for a regression guard.
+        self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
+            univariate_test=lejepa.univariate.EppsPulley(n_points=17),
+            num_slices=1024,
         )
 
-    def forward(self, video: torch.Tensor) -> dict:
+    # ── Convenience: encode only ──────────────────────────────────────────
+
+    def encode(self, videos: torch.Tensor) -> torch.Tensor:
         """
-        Full forward pass with loss computation.
+        Run only the frozen encoder + projector.
 
         Args:
-            video: (B, T, C, H, W) — video clip
+            videos: (B, T, C, H, W)
 
         Returns:
-            dict with keys:
-                'loss'        — total training loss
-                'loss_pred'   — prediction MSE
-                'loss_sigreg' — SIGReg regularization
-                'isotropy'    — isotropy score (monitoring metric)
-                'Z'           — latent embeddings (B, T, D)
-                'Z_pred'      — predicted embeddings (B, T, D)
+            Z: (B, T_eff, D)  — projected encoder features.
         """
-        B, T, C, H, W = video.shape
+        Z_raw = self.encoder(videos)  # (B, T_eff, D)
+        return self.projector(Z_raw)  # (B, T_eff, D)
 
-        # 1. Encode all frames
-        Z = self.encoder.encode_video(video)    # (B, T, D)
+    # ── Full forward ──────────────────────────────────────────────────────
 
-        # 2. Predict next frames (teacher forcing)
-        Z_pred = self.predictor(Z)              # (B, T, D)
+    def forward(self, videos: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            videos: (B, T, C, H, W)
 
-        # 3. Prediction loss — target detached from gradient flow
-        # Z_pred[:, :-1] predicts Z[:, 1:]
-        Z_target = Z[:, 1:, :].detach()        # (B, T-1, D)
-        Z_source = Z_pred[:, :-1, :]           # (B, T-1, D)
-        loss_pred = F.mse_loss(Z_source, Z_target)
+        Returns dict with keys:
+            loss          — total training loss (scalar)
+            loss_mse      — temporal prediction MSE component
+            loss_sigreg   — SIGReg regularisation component
+            Z             — encoder features (B, T_eff, D), detached
+            Z_pred        — predictor output  (B, T_eff, D)
+        """
+        # ── 1. Encode (no grad — encoder is frozen) ──────────────────────
+        Z = self.encode(videos)  # (B, T_eff, D)
+        B, T, D = Z.shape
 
-        # 4. SIGReg — applied step-wise, averaged over timesteps
-        # Reshape: (B, T, D) → T × (B, D) for per-timestep computation
-        sigreg_losses = []
-        for t in range(T):
-            # SIGReg sur Z_pred — le predictor est entraînable
-            # même avec encoder gelé, le predictor peut apprendre
-            # à produire des embeddings isotropiques
-            Z_t = Z_pred[:, t, :]              # (B, D)
-            sigreg_losses.append(self.sigreg(Z_t))
-        loss_sigreg = torch.stack(sigreg_losses).mean()
+        # ── 2. Predict ───────────────────────────────────────────────────
+        Z_pred = self.predictor(Z)  # (B, T, D)
 
-        # 5. Total loss
-        loss = loss_pred + self.lambda_sigreg * loss_sigreg
+        # ── 3. MSE loss ──────────────────────────────────────────────────
+        # Z_pred[:, t] predicts Z[:, t+1]  (causal, so shift by 1).
+        # Stop-gradient on targets: encoder is frozen, but we make this
+        # explicit so nothing back-props through the encoder path.
+        pred_for_loss = Z_pred[:, :-1, :]  # (B, T-1, D)
+        target_for_loss = Z[:, 1:, :].detach()  # (B, T-1, D) — stop-grad
 
-        # 6. Isotropy score (monitoring only, not gradient)
-        with torch.no_grad():
-            isotropy = self._isotropy_score(Z.reshape(-1, Z.shape[-1]))
+        loss_mse = F.mse_loss(pred_for_loss, target_for_loss)
+
+        # ── 4. SIGReg loss ───────────────────────────────────────────────
+        if self.sigreg_reduction == "per_timestep":
+            if B < 32:
+                warnings.warn(
+                    f"SIGReg per_timestep with B={B} < 32 is noisy. "
+                    "Switching to flatten reduction automatically. "
+                    "Use --sigreg_reduction flatten to silence this warning.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                loss_sigreg = self.sigreg(Z_pred.reshape(B * T, D))
+            else:
+                # Compute SIGReg per temporal position and average
+                loss_sigreg = torch.stack(
+                    [self.sigreg(Z_pred[:, t, :]) for t in range(T)]
+                ).mean()
+        else:
+            # "flatten": treat (B, T, D) as (B*T, D)
+            loss_sigreg = self.sigreg(Z_pred.reshape(B * T, D))
+
+        # ── 5. Total loss ─────────────────────────────────────────────────
+        loss = loss_mse + self.lambda_sigreg * loss_sigreg
 
         return {
             "loss": loss,
-            "loss_pred": loss_pred.detach(),
-            "loss_sigreg": loss_sigreg.detach(),
-            "isotropy": isotropy,
+            "loss_mse": loss_mse,
+            "loss_sigreg": loss_sigreg,
             "Z": Z.detach(),
-            "Z_pred": Z_pred.detach(),
+            "Z_pred": Z_pred,
         }
 
-    @torch.no_grad()
-    def _isotropy_score(self, Z: torch.Tensor) -> torch.Tensor:
-        """
-        Compute isotropy score = λ_min / λ_max of covariance matrix.
-        Score of 1.0 = perfectly isotropic. Score < 0.1 = collapsed.
 
-        Args:
-            Z: (N, D)
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
-        Returns:
-            scalar in [0, 1]
-        """
-        # Subsample if too large (covariance is D×D regardless)
-        if Z.shape[0] > 2048:
-            idx = torch.randperm(Z.shape[0])[:2048]
-            Z = Z[idx]
 
-        Z_centered = Z - Z.mean(dim=0, keepdim=True)
-        cov = (Z_centered.T @ Z_centered) / (Z.shape[0] - 1)
-
-        try:
-            eigvals = torch.linalg.eigvalsh(cov)
-            eigvals = eigvals.clamp(min=0)  # Numerical safety
-            score = eigvals.min() / (eigvals.max() + 1e-10)
-        except Exception:
-            score = torch.tensor(0.0, device=Z.device)
-
-        return score
-
-    def num_parameters(self, trainable_only: bool = True) -> int:
-        """Count model parameters."""
-        params = self.parameters() if not trainable_only else \
-                 filter(lambda p: p.requires_grad, self.parameters())
-        return sum(p.numel() for p in params)
+def _sinusoidal_pos_emb(max_len: int, dim: int) -> torch.Tensor:
+    """Standard sinusoidal position embedding, shape (max_len, dim)."""
+    position = torch.arange(max_len).unsqueeze(1)  # (max_len, 1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2) * (-math.log(10000.0) / dim)
+    )  # (dim//2,)
+    pe = torch.zeros(max_len, dim)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
